@@ -1,4 +1,4 @@
-module github.com/sanjivmadhavan/mettleMock
+module github.com/Sanjiv-Madhavan/MettleMock
 
 go 1.23.0
 
