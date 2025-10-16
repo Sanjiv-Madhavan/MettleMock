@@ -1,0 +1,27 @@
+# permissions for end users to edit postgresdatabaseinstances.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: mettlemock
+    app.kubernetes.io/managed-by: kustomize
+  name: postgresdatabaseinstance-editor-role
+rules:
+- apiGroups:
+  - database.mettle.io
+  resources:
+  - postgresdatabaseinstances
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - database.mettle.io
+  resources:
+  - postgresdatabaseinstances/status
+  verbs:
+  - get

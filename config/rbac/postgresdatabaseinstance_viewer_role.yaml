@@ -1,0 +1,23 @@
+# permissions for end users to view postgresdatabaseinstances.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  labels:
+    app.kubernetes.io/name: mettlemock
+    app.kubernetes.io/managed-by: kustomize
+  name: postgresdatabaseinstance-viewer-role
+rules:
+- apiGroups:
+  - database.mettle.io
+  resources:
+  - postgresdatabaseinstances
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - database.mettle.io
+  resources:
+  - postgresdatabaseinstances/status
+  verbs:
+  - get

@@ -1,0 +1,185 @@
+/*
+Copyright 2025.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package controller
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/go-logr/logr"
+	pgv1 "github.com/sanjivmadhavan/mettleMock/api/v1alpha1"
+	"github.com/sanjivmadhavan/mettleMock/internal/db"
+	"github.com/sanjivmadhavan/mettleMock/internal/k8s"
+	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/log"
+)
+
+// PostgresDatabaseInstanceReconciler reconciles a PostgresDatabaseInstance object
+type PostgresDatabaseInstanceReconciler struct {
+	client.Client
+	Scheme *runtime.Scheme
+	Logger logr.Logger
+	DB     db.Factory
+}
+
+const (
+	PostgresInstanceFinalizerName = "postgresinstance.cp.mettle.io"
+)
+
+// +kubebuilder:rbac:groups=database.mettle.io,resources=postgresdatabaseinstances,verbs=get;list;watch;create;update;patch;delete
+// +kubebuilder:rbac:groups=database.mettle.io,resources=postgresdatabaseinstances/status,verbs=get;update;patch
+// +kubebuilder:rbac:groups=database.mettle.io,resources=postgresdatabaseinstances/finalizers,verbs=update
+
+// Reconcile is part of the main kubernetes reconciliation loop which aims to
+// move the current state of the cluster closer to the desired state.
+// TODO(user): Modify the Reconcile function to compare the state specified by
+// the PostgresDatabaseInstance object against the actual cluster state, and then
+// perform operations to make the cluster state reflect the state specified by
+// the user.
+//
+// For more details, check Reconcile and its Result here:
+// - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.19.1/pkg/reconcile
+func (r *PostgresDatabaseInstanceReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
+	_ = log.FromContext(ctx)
+	log := r.Logger.WithValues("PgInstance", req.NamespacedName)
+
+	log.Info("Reconciliation starts")
+
+	pgInstance := &pgv1.PostgresDatabaseInstance{}
+
+	// Get PGInstance
+	if err := r.Get(ctx, req.NamespacedName, pgInstance); err != nil {
+		if !errors.IsNotFound(err) {
+			log.Error(err, "unable to get service instance")
+		}
+		return ctrl.Result{}, client.IgnoreNotFound(err)
+	}
+
+	// Register finalizer
+	if !controllerutil.ContainsFinalizer(pgInstance, PostgresInstanceFinalizerName) {
+		return r.registerFinalizer(ctx, pgInstance)
+	}
+	// handle teardown
+	if !pgInstance.DeletionTimestamp.IsZero() {
+		if err := r.teardown(ctx, pgInstance, req.Namespace); err != nil {
+			pgInstance.Status.Phase = "Error"
+			pgInstance.Status.Message = "eardown failed" + err.Error()
+			_ = r.Status().Update(ctx, pgInstance)
+			return ctrl.Result{Requeue: true, RequeueAfter: 10 * time.Second}, err
+		}
+		controllerutil.RemoveFinalizer(pgInstance, PostgresInstanceFinalizerName)
+		if err := r.Update(ctx, pgInstance); err != nil {
+			return requeueRequestWithError(err)
+		}
+
+		log.Info("Finalizer deregistered")
+		return successfullyReconciled()
+	}
+
+	// reconcile
+	pool, err := r.DB.Pool(ctx)
+	if err != nil {
+		pgInstance.Status.Phase = "Error"
+		pgInstance.Status.Message = err.Error()
+		_ = r.Status().Update(ctx, pgInstance)
+		return ctrl.Result{Requeue: true, RequeueAfter: 10 * time.Second}, err
+	}
+
+	pass, _, err := db.EnsureDatabaseRole(ctx, pool, pgInstance.Spec.DatabaseName, pgInstance.Spec.UserName, pgInstance.Spec.RotationInterval)
+	if err != nil {
+		pgInstance.Status.Phase = "Error"
+		pgInstance.Status.Message = err.Error()
+		_ = r.Status().Update(ctx, pgInstance)
+		return ctrl.Result{Requeue: true, RequeueAfter: 10 * time.Second}, err
+	}
+
+	dsn := db.BuildAppDSN(pgInstance.Spec.UserName, pass, pgInstance.Spec.DatabaseName)
+
+	secretName := fmt.Sprintf("secret-%s", pgInstance.Namespace+pgInstance.Name)
+	if err = k8s.UpsertOpaqueSecret(ctx, r.Client, req.Namespace, req.Name, map[string][]byte{
+		"dsn": []byte(dsn),
+	}, pgInstance); err != nil {
+		pgInstance.Status.Phase = "Error"
+		pgInstance.Status.Message = "Secret Upsert: " + err.Error()
+		_ = r.Status().Update(ctx, pgInstance)
+		return ctrl.Result{Requeue: true, RequeueAfter: 10 * time.Second}, err
+	}
+
+	pgInstance.Status.Phase = "Ready"
+	pgInstance.Status.Message = "Reconciled"
+	pgInstance.Status.SecretName = secretName
+	if err := r.Status().Update(ctx, pgInstance); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{}, nil
+}
+
+func (r *PostgresDatabaseInstanceReconciler) registerFinalizer(ctx context.Context, si *pgv1.PostgresDatabaseInstance) (ctrl.Result, error) {
+	log := r.Logger.WithValues("postgresInstance", si.Namespace+"/"+si.Name)
+
+	si.ObjectMeta.Finalizers = append(si.ObjectMeta.Finalizers, PostgresInstanceFinalizerName)
+	if err := r.Update(ctx, si); err != nil {
+		return requeueRequestWithError(err)
+	}
+
+	log.Info("Finalizer registered")
+	return successfullyReconciled()
+}
+
+func requeueRequestWithError(err error) (ctrl.Result, error) {
+	return ctrl.Result{Requeue: true, RequeueAfter: 10 * time.Second}, err
+}
+
+func successfullyReconciled() (ctrl.Result, error) {
+	return ctrl.Result{}, nil
+}
+
+func (r *PostgresDatabaseInstanceReconciler) teardown(ctx context.Context, pgInstance *pgv1.PostgresDatabaseInstance, namespace string) error {
+	drop := pgInstance.Spec.DropOnDelete
+	pool, err := r.DB.Pool(ctx)
+	if err != nil {
+		return err
+	}
+	if drop {
+		db.DropDatabaseAndRole(ctx, pool, pgInstance.Spec.DatabaseName, pgInstance.Spec.UserName)
+	} else {
+		db.RevokeAndKillSessions(ctx, pool, pgInstance.Spec.DatabaseName, pgInstance.Spec.UserName)
+	}
+	var secret corev1.Secret
+	secret.Name = fmt.Sprintf("secret-%s", pgInstance.Namespace+pgInstance.Name)
+	secret.Namespace = namespace
+	if err := r.Delete(ctx, &secret); err != nil {
+		return err
+	}
+	return nil
+}
+
+// SetupWithManager sets up the controller with the Manager.
+func (r *PostgresDatabaseInstanceReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	return ctrl.NewControllerManagedBy(mgr).
+		// Uncomment the following line adding a pointer to an instance of the controlled resource as an argument
+		For(&pgv1.PostgresDatabaseInstance{}).
+		Named("postgresdatabaseinstance").
+		Complete(r)
+}
